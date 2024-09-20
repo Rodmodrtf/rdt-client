@@ -6,224 +6,315 @@ using RdtClient.Data.Enums;
 using RdtClient.Data.Models.TorrentClient;
 using RdtClient.Service.Helpers;
 
-namespace RdtClient.Service.Services.TorrentClients
+namespace RdtClient.Service.Services.TorrentClients;
+
+public class RealDebridTorrentClient(ILogger<RealDebridTorrentClient> logger, IHttpClientFactory httpClientFactory) : ITorrentClient
 {
-    public class RealDebridTorrentClient : ITorrentClient
+    private TimeSpan? _offset;
+
+    private RdNetClient GetClient()
     {
-        private readonly ILogger<RealDebridTorrentClient> _logger;
-        private readonly IHttpClientFactory _httpClientFactory;
-        private TimeSpan? _offset;
-
-        public RealDebridTorrentClient(ILogger<RealDebridTorrentClient> logger, IHttpClientFactory httpClientFactory)
+        try
         {
-            _logger = logger;
-            _httpClientFactory = httpClientFactory;
-        }
+            var apiKey = Settings.Get.Provider.ApiKey;
 
-        private async Task<RdNetClient> GetClientAsync()
-        {
-            var apiKey = Settings.Get.Provider.ApiKey ?? throw new InvalidOperationException("Real-Debrid API Key not set in the settings");
+            if (String.IsNullOrWhiteSpace(apiKey))
+            {
+                throw new("Real-Debrid API Key not set in the settings");
+            }
 
-            var httpClient = _httpClientFactory.CreateClient(DiConfig.RD_CLIENT);
+            var httpClient = httpClientFactory.CreateClient(DiConfig.RD_CLIENT);
             httpClient.Timeout = TimeSpan.FromSeconds(Settings.Get.Provider.Timeout);
 
             var rdtNetClient = new RdNetClient(null, httpClient, 5);
             rdtNetClient.UseApiAuthentication(apiKey);
 
+            // Get the server time to fix up the timezones on results
             if (_offset == null)
             {
-                var serverTime = await rdtNetClient.Api.GetIsoTimeAsync();
+                var serverTime = rdtNetClient.Api.GetIsoTimeAsync().Result;
                 _offset = serverTime.Offset;
             }
 
             return rdtNetClient;
         }
-
-        private TorrentClientTorrent Map(Torrent torrent)
+        catch (AggregateException ae)
         {
-            return new TorrentClientTorrent
+            foreach (var inner in ae.InnerExceptions)
             {
-                Id = torrent.Id,
-                Filename = torrent.Filename,
-                OriginalFilename = torrent.OriginalFilename,
-                Hash = torrent.Hash,
-                Bytes = torrent.Bytes,
-                OriginalBytes = torrent.OriginalBytes,
-                Host = torrent.Host,
-                Split = torrent.Split,
-                Progress = torrent.Progress,
-                Status = torrent.Status,
-                Added = ChangeTimeZone(torrent.Added)!.Value,
-                Files = torrent.Files?.Select(m => new TorrentClientFile
-                {
-                    Path = m.Path,
-                    Bytes = m.Bytes,
-                    Id = m.Id,
-                    Selected = m.Selected
-                }).ToList() ?? new List<TorrentClientFile>(),
-                Links = torrent.Links,
-                Ended = ChangeTimeZone(torrent.Ended),
-                Speed = torrent.Speed,
-                Seeders = torrent.Seeders,
-            };
-        }
-
-        public async Task<IList<TorrentClientTorrent>> GetTorrents()
-        {
-            var offset = 0;
-            var results = new List<Torrent>();
-
-            while (true)
-            {
-                var pagedResults = await (await GetClientAsync()).Torrents.GetAsync(offset, 5000);
-                results.AddRange(pagedResults);
-
-                if (!pagedResults.Any()) break;
-
-                offset += 5000;
+                logger.LogError(inner, $"The connection to RealDebrid has failed: {inner.Message}");
             }
 
-            return results.Select(Map).ToList();
+            throw;
         }
-
-        public async Task<TorrentClientUser> GetUser()
+        catch (TaskCanceledException ex) when (ex.InnerException is TimeoutException)
         {
-            var user = await (await GetClientAsync()).User.GetAsync();
+            logger.LogError(ex, $"The connection to RealDebrid has timed out: {ex.Message}");
 
-            return new TorrentClientUser
+            throw;
+        }
+        catch (TaskCanceledException ex)
+        {
+            logger.LogError(ex, $"The connection to RealDebrid has timed out: {ex.Message}");
+
+            throw; 
+        }
+    }
+
+    private TorrentClientTorrent Map(Torrent torrent)
+    {
+        return new()
+        {
+            Id = torrent.Id,
+            Filename = torrent.Filename,
+            OriginalFilename = torrent.OriginalFilename,
+            Hash = torrent.Hash,
+            Bytes = torrent.Bytes,
+            OriginalBytes = torrent.OriginalBytes,
+            Host = torrent.Host,
+            Split = torrent.Split,
+            Progress = torrent.Progress,
+            Status = torrent.Status,
+            Added = ChangeTimeZone(torrent.Added)!.Value,
+            Files = (torrent.Files ?? []).Select(m => new TorrentClientFile
             {
-                Username = user.Username,
-                Expiration = user.Premium > 0 ? user.Expiration : (DateTimeOffset?)null
-            };
-        }
+                Path = m.Path,
+                Bytes = m.Bytes,
+                Id = m.Id,
+                Selected = m.Selected
+            }).ToList(),
+            Links = torrent.Links,
+            Ended = ChangeTimeZone(torrent.Ended),
+            Speed = torrent.Speed,
+            Seeders = torrent.Seeders,
+        };
+    }
 
-        public async Task<string> AddMagnet(string magnetLink)
+    public async Task<IList<TorrentClientTorrent>> GetTorrents()
+    {
+        var offset = 0;
+        var results = new List<Torrent>();
+
+        while (true)
         {
-            var result = await (await GetClientAsync()).Torrents.AddMagnetAsync(magnetLink);
-            return result.Id;
-        }
+            var pagedResults = await GetClient().Torrents.GetAsync(offset, 5000);
 
-        public async Task<string> AddFile(byte[] bytes)
-        {
-            var result = await (await GetClientAsync()).Torrents.AddFileAsync(bytes);
-            return result.Id;
-        }
+            results.AddRange(pagedResults);
 
-        public async Task<IList<TorrentClientAvailableFile>> GetAvailableFiles(string hash)
-        {
-            var result = await (await GetClientAsync()).Torrents.GetAvailableFiles(hash);
-            var files = result.SelectMany(m => m.Value).SelectMany(m => m.Value).SelectMany(m => m.Values);
-
-            var groups = files.Where(m => m.Filename != null).GroupBy(m => $"{m.Filename}-{m.Filesize}");
-
-            return groups.Select(m => new TorrentClientAvailableFile
+            if (pagedResults.Count == 0)
             {
-                Filename = m.First().Filename!,
-                Filesize = m.First().Filesize
-            }).ToList();
-        }
-
-        public async Task SelectFiles(Data.Models.Data.Torrent torrent)
-        {
-            var files = torrent.Files;
-
-            Log("Selecting files", torrent);
-
-            files = torrent.DownloadAction switch
-            {
-                TorrentDownloadAction.DownloadAvailableFiles => await FilterAvailableFiles(torrent, files.ToList()),
-                TorrentDownloadAction.DownloadAll => files.ToList(),
-                TorrentDownloadAction.DownloadManual => files.Where(m => torrent.ManualFiles.Any(f => m.Path.EndsWith(f))).ToList(),
-                _ => files
-            };
-
-            Log($"Selecting {files.Count}/{torrent.Files.Count} files", torrent);
-
-            if (torrent.DownloadMinSize > 0)
-            {
-                var minFileSize = torrent.DownloadMinSize * 1024 * 1024;
-                files = files.Where(m => m.Bytes > minFileSize).ToList();
-                Log($"Found {files.Count} files that match the minimum file size criteria", torrent);
+                break;
             }
 
-            files = FilterByRegex(torrent, files);
-
-            if (!files.Any())
-            {
-                Log("Filtered all files out! Downloading ALL files instead!", torrent);
-                files = torrent.Files;
-            }
-
-            var fileIds = files.Select(m => m.Id.ToString()).ToArray();
-            Log($"Selecting files: {string.Join(", ", files.Select(f => $"{f.Id}: {f.Path} ({f.Bytes}b)"))}", torrent);
-
-            await (await GetClientAsync()).Torrents.SelectFilesAsync(torrent.RdId!, fileIds);
+            offset += 5000;
         }
 
-        private async Task<IList<TorrentClientFile>> FilterAvailableFiles(Data.Models.Data.Torrent torrent, List<TorrentClientFile> files)
+        return results.Select(Map).ToList();
+    }
+
+    public async Task<TorrentClientUser> GetUser()
+    {
+        var user = await GetClient().User.GetAsync();
+            
+        return new()
         {
-            Log("Determining which files are already available on RealDebrid", torrent);
+            Username = user.Username,
+            Expiration = user.Premium > 0 ? user.Expiration : null
+        };
+    }
+
+    public async Task<String> AddMagnet(String magnetLink)
+    {
+        var result = await GetClient().Torrents.AddMagnetAsync(magnetLink);
+
+        return result.Id;
+    }
+
+    public async Task<String> AddFile(Byte[] bytes)
+    {
+        var result = await GetClient().Torrents.AddFileAsync(bytes);
+
+        return result.Id;
+    }
+
+    public async Task<IList<TorrentClientAvailableFile>> GetAvailableFiles(String hash)
+    {
+        var result = await GetClient().Torrents.GetAvailableFiles(hash);
+
+        var files = result.SelectMany(m => m.Value).SelectMany(m => m.Value).SelectMany(m => m.Values);
+
+        var groups = files.Where(m => m.Filename != null).GroupBy(m => $"{m.Filename}-{m.Filesize}");
+
+        var torrentClientAvailableFiles = groups.Select(m => new TorrentClientAvailableFile
+        {
+            Filename = m.First().Filename!,
+            Filesize = m.First().Filesize
+        }).ToList();
+
+        return torrentClientAvailableFiles;
+    }
+
+    public async Task SelectFiles(Data.Models.Data.Torrent torrent)
+    {
+        var files = torrent.Files;
+
+        Log("Seleting files", torrent);
+
+        if (torrent.DownloadAction == TorrentDownloadAction.DownloadAvailableFiles)
+        {
+            Log($"Determining which files are already available on RealDebrid", torrent);
+
             var availableFiles = await GetAvailableFiles(torrent.Hash);
+
             Log($"Found {files.Count}/{torrent.Files.Count} available files on RealDebrid", torrent);
 
-            return files.Where(m => availableFiles.Any(f => m.Path.EndsWith(f.Filename))).ToList();
+            files = torrent.Files.Where(m => availableFiles.Any(f => m.Path.EndsWith(f.Filename))).ToList();
+        }
+        else if (torrent.DownloadAction == TorrentDownloadAction.DownloadAll)
+        {
+            Log("Selecting all files", torrent);
+            files = [.. torrent.Files];
+        }
+        else if (torrent.DownloadAction == TorrentDownloadAction.DownloadManual)
+        {
+            Log("Selecting manual selected files", torrent);
+            files = torrent.Files.Where(m => torrent.ManualFiles.Any(f => m.Path.EndsWith(f))).ToList();
         }
 
-        private List<TorrentClientFile> FilterByRegex(Data.Models.Data.Torrent torrent, List<TorrentClientFile> files)
+        Log($"Selecting {files.Count}/{torrent.Files.Count} files", torrent);
+
+        if (torrent.DownloadAction != TorrentDownloadAction.DownloadManual && torrent.DownloadMinSize > 0)
         {
-            if (!string.IsNullOrWhiteSpace(torrent.IncludeRegex))
+            var minFileSize = torrent.DownloadMinSize * 1024 * 1024;
+
+            Log($"Determining which files are over {minFileSize} bytes", torrent);
+
+            files = files.Where(m => m.Bytes > minFileSize)
+                         .ToList();
+
+            Log($"Found {files.Count} files that match the minimum file size criterea", torrent);
+        }
+
+        if (!String.IsNullOrWhiteSpace(torrent.IncludeRegex))
+        {
+            Log($"Using regular expression {torrent.IncludeRegex} to include only files matching this regex", torrent);
+
+            var newFiles = new List<TorrentClientFile>();
+            foreach (var file in files)
             {
-                files = files.Where(file => Regex.IsMatch(file.Path, torrent.IncludeRegex)).ToList();
-                Log($"Found {files.Count} files that match the include regex", torrent);
+                if (Regex.IsMatch(file.Path, torrent.IncludeRegex))
+                {
+                    Log($"* Including {file.Path}", torrent);
+                    newFiles.Add(file);
+                }
+                else
+                {
+                    Log($"* Excluding {file.Path}", torrent);
+                }
             }
-            else if (!string.IsNullOrWhiteSpace(torrent.ExcludeRegex))
+
+            files = newFiles;
+
+            Log($"Found {files.Count} files that match the regex", torrent);
+        } 
+        else if (!String.IsNullOrWhiteSpace(torrent.ExcludeRegex))
+        {
+            Log($"Using regular expression {torrent.IncludeRegex} to ignore files matching this regex", torrent);
+
+            var newFiles = new List<TorrentClientFile>();
+            foreach (var file in files)
             {
-                files = files.Where(file => !Regex.IsMatch(file.Path, torrent.ExcludeRegex)).ToList();
-                Log($"Found {files.Count} files that match the exclude regex", torrent);
+                if (!Regex.IsMatch(file.Path, torrent.ExcludeRegex))
+                {
+                    Log($"* Including {file.Path}", torrent);
+                    newFiles.Add(file);
+                }
+                else
+                {
+                    Log($"* Excluding {file.Path}", torrent);
+                }
             }
-            return files;
+
+            files = newFiles;
+
+            Log($"Found {files.Count} files that match the regex", torrent);
         }
 
-        public async Task Delete(string torrentId)
+        if (files.Count == 0)
         {
-            await (await GetClientAsync()).Torrents.DeleteAsync(torrentId);
+            Log($"Filtered all files out! Downloading ALL files instead!", torrent);
+
+            files = torrent.Files;
         }
 
-        public async Task<string> Unrestrict(string link)
+        var fileIds = files.Select(m => m.Id.ToString()).ToArray();
+
+        Log($"Selecting files:");
+
+        foreach (var file in files)
         {
-            var result = await (await GetClientAsync()).Unrestrict.LinkAsync(link);
-            return result.Download ?? throw new InvalidOperationException("Unrestrict returned an invalid download");
+            Log($"{file.Id}: {file.Path} ({file.Bytes}b)");
         }
 
-        public async Task<Data.Models.Data.Torrent> UpdateData(Data.Models.Data.Torrent torrent, TorrentClientTorrent? torrentClientTorrent)
-        {
-            if (torrent.RdId == null) return torrent;
+        Log("", torrent);
 
-            if (torrentClientTorrent == null || torrentClientTorrent.Ended == null || string.IsNullOrEmpty(torrentClientTorrent.Filename))
+        await GetClient().Torrents.SelectFilesAsync(torrent.RdId!, [.. fileIds]);
+    }
+
+    public async Task Delete(String torrentId)
+    {
+        await GetClient().Torrents.DeleteAsync(torrentId);
+    }
+
+    public async Task<String> Unrestrict(String link)
+    {
+        var result = await GetClient().Unrestrict.LinkAsync(link);
+
+        if (result.Download == null)
+        {
+            throw new($"Unrestrict returned an invalid download");
+        }
+
+        return result.Download;
+    }
+
+    public async Task<Data.Models.Data.Torrent> UpdateData(Data.Models.Data.Torrent torrent, TorrentClientTorrent? torrentClientTorrent)
+    {
+        try
+        {
+            if (torrent.RdId == null)
             {
-                torrentClientTorrent = await GetInfo(torrent.RdId) ?? throw new InvalidOperationException("Resource not found");
+                return torrent;
             }
 
-            UpdateTorrentFields(torrent, torrentClientTorrent);
+            if (torrentClientTorrent == null || torrentClientTorrent.Ended == null || String.IsNullOrEmpty(torrentClientTorrent.Filename))
+            {
+                torrentClientTorrent = await GetInfo(torrent.RdId) ?? throw new($"Resource not found");
+            }
 
-            return torrent;
-        }
-
-        private void UpdateTorrentFields(Data.Models.Data.Torrent torrent, TorrentClientTorrent torrentClientTorrent)
-        {
-            if (!string.IsNullOrWhiteSpace(torrentClientTorrent.Filename))
+            if (!String.IsNullOrWhiteSpace(torrentClientTorrent.Filename))
+            {
                 torrent.RdName = torrentClientTorrent.Filename;
+            }
 
-            if (!string.IsNullOrWhiteSpace(torrentClientTorrent.OriginalFilename))
+            if (!String.IsNullOrWhiteSpace(torrentClientTorrent.OriginalFilename))
+            {
                 torrent.RdName = torrentClientTorrent.OriginalFilename;
+            }
 
             if (torrentClientTorrent.Bytes > 0)
+            {
                 torrent.RdSize = torrentClientTorrent.Bytes;
+            }
             else if (torrentClientTorrent.OriginalBytes > 0)
+            {
                 torrent.RdSize = torrentClientTorrent.OriginalBytes;
+            }
 
             if (torrentClientTorrent.Files != null && torrentClientTorrent.Files.Count > 0)
+            {
                 torrent.RdFiles = JsonConvert.SerializeObject(torrentClientTorrent.Files);
+            }
 
             torrent.RdHost = torrentClientTorrent.Host;
             torrent.RdSplit = torrentClientTorrent.Split;
@@ -246,10 +337,26 @@ namespace RdtClient.Service.Services.TorrentClients
                 "virus" => TorrentStatus.Error,
                 "compressing" => TorrentStatus.Downloading,
                 "uploading" => TorrentStatus.Uploading,
-                _ => TorrentStatus.Unknown
+                "dead" => TorrentStatus.Error,
+                _ => TorrentStatus.Error
             };
         }
-        public async Task<IList<String>?> GetDownloadLinks(Data.Models.Data.Torrent torrent)
+        catch (Exception ex)
+        {
+            if (ex.Message == "Resource not found")
+            {
+                torrent.RdStatusRaw = "deleted";
+            }
+            else
+            {
+                throw;
+            }
+        }
+
+        return torrent;
+    }
+
+    public async Task<IList<String>?> GetDownloadLinks(Data.Models.Data.Torrent torrent)
     {
         if (torrent.RdId == null)
         {
@@ -310,22 +417,30 @@ namespace RdtClient.Service.Services.TorrentClients
         return null;
     }
 
-        public async Task<TorrentClientTorrent?> GetInfo(string id)
+    private DateTimeOffset? ChangeTimeZone(DateTimeOffset? dateTimeOffset)
+    {
+        if (_offset == null)
         {
-            var result = await (await GetClientAsync()).Torrents.GetAsync(id);
-            return result == null ? null : Map(result);
+            return dateTimeOffset;
         }
 
-        private DateTimeOffset? ChangeTimeZone(DateTimeOffset? time)
-        {
-            if (time == null || _offset == null) return time;
+        return dateTimeOffset?.Subtract(_offset.Value).ToOffset(_offset.Value);
+    }
 
-            return time.Value.AddSeconds(_offset.Value.TotalSeconds);
+    private async Task<TorrentClientTorrent> GetInfo(String torrentId)
+    {
+        var result = await GetClient().Torrents.GetInfoAsync(torrentId);
+
+        return Map(result);
+    }
+
+    private void Log(String message, Data.Models.Data.Torrent? torrent = null)
+    {
+        if (torrent != null)
+        {
+            message = $"{message} {torrent.ToLog()}";
         }
 
-        private void Log(string message, Data.Models.Data.Torrent torrent)
-        {
-            _logger.LogInformation($"[{torrent.Id}] {message}");
-        }
+        logger.LogDebug(message);
     }
 }
