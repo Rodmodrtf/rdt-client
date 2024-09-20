@@ -31,58 +31,51 @@ public class SymlinkDownloader : IDownloader
     }
 
     public async Task<string> Download()
+{
+    _logger.Debug($"Starting symlink resolving of {_uri}, writing to path: {_path}");
+
+    try
     {
-        _logger.Debug($"Starting symlink resolving of {_uri}, writing to path: {_path}");
+        var filePath = new FileInfo(_path);
+        var rcloneMountPath = Settings.Get.DownloadClient.RcloneMountPath.TrimEnd('\\', '/');
+        var searchSubDirectories = rcloneMountPath.EndsWith('*');
+        rcloneMountPath = rcloneMountPath.TrimEnd('*').TrimEnd('\\', '/');
 
-        try
+        if (!Directory.Exists(rcloneMountPath))
+            throw new DirectoryNotFoundException($"Mount path {rcloneMountPath} does not exist!");
+
+        var fileName = filePath.Name;
+        var fileExtension = filePath.Extension;
+
+        if (UnwantedExtensions.Contains(fileExtension))
+            throw new InvalidOperationException("Cannot handle compressed files with symlink downloader.");
+
+        DownloadProgress?.Invoke(this, new DownloadProgressEventArgs { BytesDone = 0, BytesTotal = 0, Speed = 0 });
+
+        var potentialFilePaths = GetPotentialFilePaths(rcloneMountPath, filePath);
+        string? foundFilePath = await FindFileInRcloneMount(rcloneMountPath, potentialFilePaths, fileName, searchSubDirectories);
+
+        if (foundFilePath == null)
         {
-            var filePath = new FileInfo(_path);
-            var rcloneMountPath = Settings.Get.DownloadClient.RcloneMountPath.TrimEnd('\\', '/');
-            var searchSubDirectories = rcloneMountPath.EndsWith('*');
-            rcloneMountPath = rcloneMountPath.TrimEnd('*').TrimEnd('\\', '/');
-
-            if (!Directory.Exists(rcloneMountPath))
-            {
-                throw new DirectoryNotFoundException($"Mount path {rcloneMountPath} does not exist!");
-            }
-
-            var fileName = filePath.Name;
-            var fileExtension = filePath.Extension;
-            var fileNameWithoutExtension = fileName.Replace(fileExtension, "");
-            var pathWithoutFileName = _path.Replace(fileName, "").TrimEnd('\\', '/');
-            var searchPath = Path.Combine(rcloneMountPath, pathWithoutFileName);
-
-            if (UnwantedExtensions.Contains(fileExtension))
-            {
-                throw new InvalidOperationException("Cannot handle compressed files with symlink downloader.");
-            }
-
-            DownloadProgress?.Invoke(this, new DownloadProgressEventArgs { BytesDone = 0, BytesTotal = 0, Speed = 0 });
-
-            var potentialFilePaths = GetPotentialFilePaths(searchPath, fileName, fileNameWithoutExtension);
-            string? file = await FindFileInRcloneMount(rcloneMountPath, potentialFilePaths, fileName, searchSubDirectories);
-
-            if (file == null)
-            {
-                LogAvailableDirectories(rcloneMountPath);
-                throw new FileNotFoundException("Could not find file from rclone mount!");
-            }
-
-            _logger.Debug($"Creating symbolic link from {file} to {_destinationPath}");
-            if (!TryCreateSymbolicLink(file, _destinationPath))
-            {
-                throw new InvalidOperationException("Could not create symbolic link!");
-            }
-
-            DownloadComplete?.Invoke(this, new DownloadCompleteEventArgs());
-            return file;
+            LogAvailableDirectories(rcloneMountPath);
+            throw new FileNotFoundException("Could not find file from rclone mount!");
         }
-        catch (Exception ex)
-        {
-            DownloadComplete?.Invoke(this, new DownloadCompleteEventArgs { Error = ex.Message });
-            throw;
-        }
+
+        _logger.Debug($"Creating symbolic link from {foundFilePath} to {_destinationPath}");
+        if (!TryCreateSymbolicLink(foundFilePath, _destinationPath))
+            throw new InvalidOperationException("Could not create symbolic link!");
+
+        DownloadComplete?.Invoke(this, new DownloadCompleteEventArgs());
+        return foundFilePath;
     }
+    catch (Exception ex)
+    {
+        DownloadComplete?.Invoke(this, new DownloadCompleteEventArgs { Error = ex.ToString() });
+        throw;
+    }
+}
+
+// Other methods remain mostly unchanged
 
     public Task Cancel()
     {
