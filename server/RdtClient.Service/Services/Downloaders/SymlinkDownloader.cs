@@ -52,7 +52,7 @@ public class SymlinkDownloader : IDownloader
 
         DownloadProgress?.Invoke(this, new DownloadProgressEventArgs { BytesDone = 0, BytesTotal = 0, Speed = 0 });
 
-        var potentialFilePaths = GetPotentialFilePaths(rcloneMountPath, filePath);
+        var potentialFilePaths = GetPotentialFilePaths(rcloneMountPath, fileName, fileName.Replace(fileExtension, ""));
         string? foundFilePath = await FindFileInRcloneMount(rcloneMountPath, potentialFilePaths, fileName, searchSubDirectories);
 
         if (foundFilePath == null)
@@ -74,7 +74,6 @@ public class SymlinkDownloader : IDownloader
         throw;
     }
 }
-
 // Other methods remain mostly unchanged
 
     public Task Cancel()
