@@ -310,16 +310,6 @@ namespace RdtClient.Service.Services.TorrentClients
         return null;
     }
 
-    private DateTimeOffset? ChangeTimeZone(DateTimeOffset? dateTimeOffset)
-    {
-        if (_offset == null)
-        {
-            return dateTimeOffset;
-        }
-
-        return dateTimeOffset?.Subtract(_offset.Value).ToOffset(_offset.Value);
-    }
-
         public async Task<TorrentClientTorrent?> GetInfo(string id)
         {
             var result = await (await GetClientAsync()).Torrents.GetAsync(id);
