@@ -1,161 +1,85 @@
-﻿using RdtClient.Service.Helpers;
+using RdtClient.Service.Helpers;
 using Serilog;
 
 namespace RdtClient.Service.Services.Downloaders;
 
-public class SymlinkDownloader(String uri, String destinationPath, String path) : IDownloader
+public class SymlinkDownloader : IDownloader
 {
     public event EventHandler<DownloadCompleteEventArgs>? DownloadComplete;
     public event EventHandler<DownloadProgressEventArgs>? DownloadProgress;
 
     private readonly CancellationTokenSource _cancellationToken = new();
-
     private readonly ILogger _logger = Log.ForContext<SymlinkDownloader>();
-
-    private const Int32 MaxRetries = 10;
-
-    public async Task<String> Download()
+    private const int MaxRetries = 10;
+    
+    private static readonly List<string> UnwantedExtensions = new()
     {
-        _logger.Debug($"Starting symlink resolving of {uri}, writing to path: {path}");
+        ".zip",
+        ".rar",
+        ".tar"
+    };
+
+    private readonly string _uri;
+    private readonly string _destinationPath;
+    private readonly string _path;
+
+    public SymlinkDownloader(string uri, string destinationPath, string path)
+    {
+        _uri = uri;
+        _destinationPath = destinationPath;
+        _path = path;
+    }
+
+    public async Task<string> Download()
+    {
+        _logger.Debug($"Starting symlink resolving of {_uri}, writing to path: {_path}");
 
         try
         {
-            var filePath = new FileInfo(path);
-
-            var rcloneMountPath = Settings.Get.DownloadClient.RcloneMountPath.TrimEnd(['\\', '/']);
+            var filePath = new FileInfo(_path);
+            var rcloneMountPath = Settings.Get.DownloadClient.RcloneMountPath.TrimEnd('\\', '/');
             var searchSubDirectories = rcloneMountPath.EndsWith('*');
-            rcloneMountPath = rcloneMountPath.TrimEnd('*').TrimEnd(['\\', '/']);
+            rcloneMountPath = rcloneMountPath.TrimEnd('*').TrimEnd('\\', '/');
 
             if (!Directory.Exists(rcloneMountPath))
             {
-                throw new($"Mount path {rcloneMountPath} does not exist!");
+                throw new DirectoryNotFoundException($"Mount path {rcloneMountPath} does not exist!");
             }
 
             var fileName = filePath.Name;
             var fileExtension = filePath.Extension;
             var fileNameWithoutExtension = fileName.Replace(fileExtension, "");
-            var pathWithoutFileName = path.Replace(fileName, "").TrimEnd(['\\', '/']);
+            var pathWithoutFileName = _path.Replace(fileName, "").TrimEnd('\\', '/');
             var searchPath = Path.Combine(rcloneMountPath, pathWithoutFileName);
 
-            List<String> unWantedExtensions =
-            [
-                ".zip",
-                ".rar",
-                ".tar"
-            ];
-
-            if (unWantedExtensions.Any(m => fileExtension == m))
+            if (UnwantedExtensions.Contains(fileExtension))
             {
-                throw new($"Cant handle compressed files with symlink downloader");
+                throw new InvalidOperationException("Cannot handle compressed files with symlink downloader.");
             }
 
-            DownloadProgress?.Invoke(this,
-                                     new()
-                                     {
-                                         BytesDone = 0,
-                                         BytesTotal = 0,
-                                         Speed = 0
-                                     });
+            DownloadProgress?.Invoke(this, new DownloadProgressEventArgs { BytesDone = 0, BytesTotal = 0, Speed = 0 });
 
-            var potentialFilePaths = new List<String>();
-
-            var directoryInfo = new DirectoryInfo(searchPath);
-            while (directoryInfo.Parent != null)
-            {
-                potentialFilePaths.Add(directoryInfo.Name);
-                directoryInfo = directoryInfo.Parent;
-
-                if (directoryInfo.FullName.TrimEnd(['\\', '/']) == rcloneMountPath)
-                {
-                    break;
-                }
-            }
-
-            potentialFilePaths.Add(fileName);
-            potentialFilePaths.Add(fileNameWithoutExtension);
-            // add an empty path so we can check for the new file in the base directory
-            potentialFilePaths.Add("");
-
-            potentialFilePaths = potentialFilePaths.Distinct().ToList();
-
-            String? file = null;
-
-            for (var retryCount = 0; retryCount < MaxRetries; retryCount++)
-            {
-                DownloadProgress?.Invoke(this,
-                                         new()
-                                         {
-                                             BytesDone = retryCount,
-                                             BytesTotal = 10,
-                                             Speed = 1
-                                         });
-
-                _logger.Debug($"Searching {rcloneMountPath} for {fileName} (attempt #{retryCount})...");
-
-                file = FindFile(rcloneMountPath, potentialFilePaths, fileName);
-
-                if (file == null && searchSubDirectories)
-                {
-                    var subDirectories = Directory.GetDirectories(rcloneMountPath, "*.*", SearchOption.TopDirectoryOnly);
-
-                    foreach (var subDirectory in subDirectories)
-                    {
-                        file = FindFile(Path.Combine(rcloneMountPath, subDirectory), potentialFilePaths, fileName);
-
-                        if (file != null)
-                        {
-                            break;
-                        }
-                    }
-                }
-
-                if (file == null)
-                {
-                    await Task.Delay(1000 * retryCount);
-                }
-                else
-                {
-                    break;
-                }
-            }
+            var potentialFilePaths = GetPotentialFilePaths(searchPath, fileName, fileNameWithoutExtension);
+            string? file = await FindFileInRcloneMount(rcloneMountPath, potentialFilePaths, fileName, searchSubDirectories);
 
             if (file == null)
             {
-                _logger.Debug($"Unable to find file in rclone mount. Folders available in {rcloneMountPath}: ");
-                try
-                {
-                    var allFolders = FileHelper.GetDirectoryContents(rcloneMountPath);
-
-                    _logger.Debug(allFolders);
-                }
-                catch(Exception ex)
-                {
-                    _logger.Error(ex.Message);
-                }
-                
-                throw new("Could not find file from rclone mount!");
+                LogAvailableDirectories(rcloneMountPath);
+                throw new FileNotFoundException("Could not find file from rclone mount!");
             }
 
-            _logger.Debug($"Creating symbolic link from {file} to {destinationPath}");
-
-            var result = TryCreateSymbolicLink(file, destinationPath);
-
-            if (!result)
+            _logger.Debug($"Creating symbolic link from {file} to {_destinationPath}");
+            if (!TryCreateSymbolicLink(file, _destinationPath))
             {
-                throw new("Could not find file from rclone mount!");
+                throw new InvalidOperationException("Could not create symbolic link!");
             }
 
-            DownloadComplete?.Invoke(this, new());
-
+            DownloadComplete?.Invoke(this, new DownloadCompleteEventArgs());
             return file;
         }
         catch (Exception ex)
         {
-            DownloadComplete?.Invoke(this, new()
-            {
-                Error = ex.Message
-            });
-
+            DownloadComplete?.Invoke(this, new DownloadCompleteEventArgs { Error = ex.Message });
             throw;
         }
     }
@@ -163,26 +87,72 @@ public class SymlinkDownloader(String uri, String destinationPath, String path) 
     public Task Cancel()
     {
         _cancellationToken.Cancel(false);
-
         return Task.CompletedTask;
     }
 
-    public Task Pause()
+    public Task Pause() => Task.CompletedTask;
+
+    public Task Resume() => Task.CompletedTask;
+
+    private List<string> GetPotentialFilePaths(string searchPath, string fileName, string fileNameWithoutExtension)
     {
-        return Task.CompletedTask;
+        var potentialFilePaths = new List<string>();
+        var directoryInfo = new DirectoryInfo(searchPath);
+
+        while (directoryInfo.Parent != null)
+        {
+            potentialFilePaths.Add(directoryInfo.Name);
+            directoryInfo = directoryInfo.Parent;
+            if (directoryInfo.FullName.TrimEnd('\\', '/') == searchPath)
+            {
+                break;
+            }
+        }
+
+        potentialFilePaths.Add(fileName);
+        potentialFilePaths.Add(fileNameWithoutExtension);
+        potentialFilePaths.Add(""); // Add an empty path to check for the new file in the base directory
+
+        return potentialFilePaths.Distinct().ToList();
     }
 
-    public Task Resume()
+    private async Task<string?> FindFileInRcloneMount(string rcloneMountPath, List<string> potentialFilePaths, string fileName, bool searchSubDirectories)
     {
-        return Task.CompletedTask;
+        for (var retryCount = 0; retryCount < MaxRetries; retryCount++)
+        {
+            DownloadProgress?.Invoke(this, new DownloadProgressEventArgs { BytesDone = retryCount, BytesTotal = 10, Speed = 1 });
+            _logger.Debug($"Searching {rcloneMountPath} for {fileName} (attempt #{retryCount})...");
+
+            var file = FindFile(rcloneMountPath, potentialFilePaths, fileName);
+            if (file != null)
+            {
+                return file;
+            }
+
+            if (searchSubDirectories)
+            {
+                var subDirectories = Directory.GetDirectories(rcloneMountPath, "*.*", SearchOption.TopDirectoryOnly);
+                foreach (var subDirectory in subDirectories)
+                {
+                    file = FindFile(Path.Combine(rcloneMountPath, subDirectory), potentialFilePaths, fileName);
+                    if (file != null)
+                    {
+                        return file;
+                    }
+                }
+            }
+
+            await Task.Delay(1000 * retryCount);
+        }
+
+        return null;
     }
 
-    private String? FindFile(String rootPath, List<String> filePaths, String fileName)
+    private string? FindFile(string rootPath, List<string> filePaths, string fileName)
     {
         foreach (var potentialFilePath in filePaths)
         {
             var potentialFilePathWithFileName = Path.Combine(rootPath, potentialFilePath, fileName);
-
             _logger.Debug($"Searching {potentialFilePathWithFileName}...");
 
             if (File.Exists(potentialFilePathWithFileName))
@@ -194,28 +164,38 @@ public class SymlinkDownloader(String uri, String destinationPath, String path) 
         return null;
     }
 
-    private Boolean TryCreateSymbolicLink(String sourcePath, String symlinkPath)
+    private bool TryCreateSymbolicLink(string sourcePath, string symlinkPath)
     {
         try
         {
             File.CreateSymbolicLink(symlinkPath, sourcePath);
-
             if (File.Exists(symlinkPath)) // Double-check that the link was created
             {
                 _logger.Information($"Created symbolic link from {sourcePath} to {symlinkPath}");
-
                 return true;
             }
 
             _logger.Error($"Failed to create symbolic link from {sourcePath} to {symlinkPath}");
-
             return false;
         }
         catch (Exception ex)
         {
             _logger.Error($"Error creating symbolic link from {sourcePath} to {symlinkPath}: {ex.Message}");
-
             return false;
+        }
+    }
+
+    private void LogAvailableDirectories(string rcloneMountPath)
+    {
+        _logger.Debug($"Unable to find file in rclone mount. Folders available in {rcloneMountPath}:");
+        try
+        {
+            var allFolders = FileHelper.GetDirectoryContents(rcloneMountPath);
+            _logger.Debug(allFolders);
+        }
+        catch (Exception ex)
+        {
+            _logger.Error($"Error listing directories: {ex.Message}");
         }
     }
 }
