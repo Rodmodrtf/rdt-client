@@ -1,9 +1,9 @@
 # Stage 1 - Build the frontend
 FROM node:18-alpine3.18 AS node-build-env
 ARG TARGETPLATFORM
-ENV TARGETPLATFORM=${TARGETPLATFORM:-linux/amd64}
+ENV TARGETPLATFORM=${TARGETPLATFORM:-linux/arm64}
 ARG BUILDPLATFORM
-ENV BUILDPLATFORM=${BUILDPLATFORM:-linux/amd64}
+ENV BUILDPLATFORM=${BUILDPLATFORM:-linux/arm64}
 
 RUN mkdir /appclient
 WORKDIR /appclient
@@ -12,7 +12,7 @@ RUN apk add --no-cache git python3 py3-pip make g++
 
 RUN \
    echo "**** Cloning Source Code ****" && \
-   git clone https://github.com/rogerfar/rdt-client.git . && \
+   git clone https://github.com/Rodmodrtf/rdt-client.git . && \
    cd client && \
    echo "**** Building Code  ****" && \
    npm ci && \
@@ -21,18 +21,18 @@ RUN \
 RUN ls -FCla /appclient/root
 
 # Stage 2 - Build the backend
-FROM mcr.microsoft.com/dotnet/sdk:8.0-bookworm-slim-amd64 AS dotnet-build-env
+FROM mcr.microsoft.com/dotnet/sdk:8.0-bookworm-slim-arm64v8 AS dotnet-build-env
 ARG TARGETPLATFORM
-ENV TARGETPLATFORM=${TARGETPLATFORM:-linux/amd64}
+ENV TARGETPLATFORM=${TARGETPLATFORM:-linux/arm64}
 ARG BUILDPLATFORM
-ENV BUILDPLATFORM=${BUILDPLATFORM:-linux/amd64}
+ENV BUILDPLATFORM=${BUILDPLATFORM:-linux/arm64}
 
 RUN mkdir /appserver
 WORKDIR /appserver
 
 RUN \
    echo "**** Cloning Source Code ****" && \
-   git clone https://github.com/rogerfar/rdt-client.git . && \
+   git clone https://github.com/Rodmodrtf/rdt-client.git . && \
    echo "**** Building Source Code for $TARGETPLATFORM on $BUILDPLATFORM ****" && \
    cd server && \
    dotnet restore --no-cache RdtClient.sln && dotnet publish --no-restore -c Release -o out ; 
@@ -40,9 +40,9 @@ RUN \
 # Stage 3 - Build runtime image
 FROM ghcr.io/linuxserver/baseimage-alpine:3.20
 ARG TARGETPLATFORM
-ENV TARGETPLATFORM=${TARGETPLATFORM:-linux/amd64}
+ENV TARGETPLATFORM=${TARGETPLATFORM:-linux/arm64}
 ARG BUILDPLATFORM
-ENV BUILDPLATFORM=${BUILDPLATFORM:-linux/amd64}
+ENV BUILDPLATFORM=${BUILDPLATFORM:-linux/arm64}
 
 # set version label
 ARG BUILD_DATE
